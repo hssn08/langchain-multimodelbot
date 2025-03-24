@@ -1,12 +1,12 @@
 # Core dependencies - with fixed versions
 streamlit==1.32.0
 langchain==0.2.0
-langchain-core==0.1.46
+# langchain-core==0.1.46  # Removed this line as it conflicts with langchain
 langchain-community==0.0.13
 langchain-openai==0.0.5
 langchain-anthropic==0.1.1
 langchain-google-genai==0.0.3
-langchain-text-splitters==0.0.1
+# langchain-text-splitters==0.0.1  # Removed this line as it conflicts with langchain
 
 # Document processing - primary options
 pypdf==3.15.1
