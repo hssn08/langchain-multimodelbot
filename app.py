@@ -18,6 +18,23 @@ from langchain_anthropic import ChatAnthropic
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
 
+# Safe rerun function to handle different Streamlit versions
+def safe_rerun():
+    """
+    Safely rerun the app regardless of streamlit version.
+    Works with both older versions using experimental_rerun and newer versions using rerun.
+    """
+    try:
+        # Try the newer method first
+        st.rerun()
+    except AttributeError:
+        # Fall back to the older method
+        try:
+            st.experimental_rerun()
+        except AttributeError:
+            # If both fail, just show a message
+            st.warning("Couldn't automatically refresh. Please refresh the page manually.")
+
 # Set up API keys from Streamlit secrets
 if 'OPENAI_API_KEY' in st.secrets:
     os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
@@ -648,7 +665,7 @@ def main():
                 if new_model_id != st.session_state.chatbot.model_name:
                     st.session_state.chatbot.set_model(new_model_id)
                     st.success(f"Switched to {new_model}")
-                    st.experimental_rerun()  # Refresh the page to update the model selection
+                    safe_rerun()  # Use safe rerun function
         
         with col3:
             # Clear chat button
@@ -656,7 +673,7 @@ def main():
                 st.session_state.chatbot.clear_history()
                 st.session_state.messages = []
                 st.success("Chat history cleared")
-                st.experimental_rerun()
+                safe_rerun()  # Use safe rerun function
     
     # PDF upload capability in the main area
     if st.session_state.chatbot:
