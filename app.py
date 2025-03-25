@@ -7,15 +7,10 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_community.chat_message_histories import ChatMessageHistory
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_core.runnables import RunnablePassthrough
-from langchain_community.vectorstores import FAISS
-from langchain_core.vectorstores import VectorStoreRetriever
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # Embeddings and LLM models
 from langchain_anthropic import ChatAnthropic
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 # Safe rerun function to handle different Streamlit versions
@@ -54,39 +49,39 @@ else:
     # For local development, you can use .streamlit/secrets.toml
     pass
 
-def load_pdf_with_advanced_recovery(pdf_file):
+def extract_text_from_pdf(pdf_file):
     """
-    Attempts to load a PDF using multiple methods with robust error handling.
+    Attempts to extract all text from a PDF using multiple methods with robust error handling.
     
     Args:
         pdf_file: Uploaded PDF file object
         
     Returns:
-        List of Document objects or None if all methods fail
+        String containing all text from the PDF or None if all methods fail
     """
     import tempfile
     import os
     import traceback
-    from langchain_core.documents import Document
     
     # Create a temporary file to save the uploaded PDF
     with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
         tmp_file.write(pdf_file.getvalue())
         pdf_path = tmp_file.name
     
-    documents = None
+    full_text = ""
     error_messages = []
     
     try:
-        # Method 1: Try PyPDFLoader (standard approach)
+        # Method 1: Try PyPDFLoader
         try:
             from langchain_community.document_loaders import PyPDFLoader
             loader = PyPDFLoader(pdf_path)
             documents = loader.load()
             if documents:
-                print(f"Successfully loaded PDF with PyPDFLoader: {len(documents)} pages")
+                full_text = "\n\n".join([doc.page_content for doc in documents])
+                print(f"Successfully extracted text with PyPDFLoader: {len(documents)} pages")
                 os.unlink(pdf_path)
-                return documents
+                return full_text
         except Exception as e:
             error_message = f"PyPDFLoader failed: {str(e)}"
             error_messages.append(error_message)
@@ -95,21 +90,19 @@ def load_pdf_with_advanced_recovery(pdf_file):
         # Method 2: Try PyPDF2 with strict=False
         try:
             import PyPDF2
-            documents = []
+            extracted_text = []
             with open(pdf_path, 'rb') as file:
                 try:
                     pdf_reader = PyPDF2.PdfReader(file, strict=False)
                     for i, page in enumerate(pdf_reader.pages):
                         text = page.extract_text()
                         if text and text.strip():  # Only add non-empty pages
-                            documents.append(Document(
-                                page_content=text,
-                                metadata={"page": i, "source": pdf_path}
-                            ))
-                    if documents:
-                        print(f"Successfully loaded PDF with PyPDF2: {len(documents)} pages")
+                            extracted_text.append(text)
+                    if extracted_text:
+                        full_text = "\n\n".join(extracted_text)
+                        print(f"Successfully extracted text with PyPDF2: {len(extracted_text)} pages")
                         os.unlink(pdf_path)
-                        return documents
+                        return full_text
                 except Exception as pdf_error:
                     error_message = f"PyPDF2 failed: {str(pdf_error)}"
                     error_messages.append(error_message)
@@ -122,19 +115,17 @@ def load_pdf_with_advanced_recovery(pdf_file):
         # Method 3: Try pdfplumber
         try:
             import pdfplumber
-            documents = []
+            extracted_text = []
             with pdfplumber.open(pdf_path) as pdf:
                 for i, page in enumerate(pdf.pages):
                     text = page.extract_text()
                     if text and text.strip():  # Only add non-empty pages
-                        documents.append(Document(
-                            page_content=text,
-                            metadata={"page": i, "source": pdf_path}
-                        ))
-                if documents:
-                    print(f"Successfully loaded PDF with pdfplumber: {len(documents)} pages")
+                        extracted_text.append(text)
+                if extracted_text:
+                    full_text = "\n\n".join(extracted_text)
+                    print(f"Successfully extracted text with pdfplumber: {len(extracted_text)} pages")
                     os.unlink(pdf_path)
-                    return documents
+                    return full_text
         except Exception as e:
             error_message = f"pdfplumber failed: {str(e)}"
             error_messages.append(error_message)
@@ -146,43 +137,61 @@ def load_pdf_with_advanced_recovery(pdf_file):
             import pytesseract
             from PIL import Image
             
-            documents = []
+            extracted_text = []
             images = pdf2image.convert_from_path(pdf_path)
             for i, image in enumerate(images):
                 text = pytesseract.image_to_string(image)
                 if text and text.strip():  # Only add non-empty pages
-                    documents.append(Document(
-                        page_content=text,
-                        metadata={"page": i, "source": pdf_path, "extraction_method": "OCR"}
-                    ))
-            if documents:
-                print(f"Successfully loaded PDF with OCR: {len(documents)} pages")
+                    extracted_text.append(text)
+            if extracted_text:
+                full_text = "\n\n".join(extracted_text)
+                print(f"Successfully extracted text with OCR: {len(extracted_text)} pages")
                 os.unlink(pdf_path)
-                return documents
+                return full_text
         except Exception as e:
             error_message = f"OCR method failed: {str(e)}"
             error_messages.append(error_message)
             print(error_message)
             
-        # Method 5: Try binary analysis (last resort)
+        # Method 5: Try pikepdf (repair approach)
         try:
-            with open(pdf_path, 'rb') as file:
-                binary_data = file.read()
-                
-                # Check if file might be password protected
-                if b'/Encrypt' in binary_data:
-                    error_message = "PDF appears to be password protected"
-                    error_messages.append(error_message)
-                    print(error_message)
-                
-                # Check file signature/magic bytes
-                if not binary_data.startswith(b'%PDF'):
-                    # Not a standard PDF file, might be corrupted or different format
-                    error_message = f"File doesn't have a standard PDF header. First bytes: {binary_data[:20]}"
+            import pikepdf
+            import PyPDF2
+            
+            # Create a temporary file for the repaired PDF
+            repaired_path = pdf_path + ".repaired.pdf"
+            
+            # Try to repair the PDF with pikepdf
+            with pikepdf.open(pdf_path, allow_overwriting_input=True) as pdf:
+                pdf.save(repaired_path)
+            
+            # Try to extract text from the repaired PDF
+            extracted_text = []
+            with open(repaired_path, 'rb') as file:
+                try:
+                    pdf_reader = PyPDF2.PdfReader(file, strict=False)
+                    for i, page in enumerate(pdf_reader.pages):
+                        text = page.extract_text()
+                        if text and text.strip():
+                            extracted_text.append(text)
+                    if extracted_text:
+                        full_text = "\n\n".join(extracted_text)
+                        print(f"Successfully extracted text from repaired PDF: {len(extracted_text)} pages")
+                        
+                        # Clean up temporary files
+                        try:
+                            os.unlink(original_path)
+                            os.unlink(repaired_path)
+                        except:
+                            pass
+                            
+                        return full_text
+                except Exception as e:
+                    error_message = f"Error extracting text from repaired PDF: {e}"
                     error_messages.append(error_message)
                     print(error_message)
         except Exception as e:
-            error_message = f"Binary analysis failed: {str(e)}"
+            error_message = f"PDF repair method failed: {str(e)}"
             error_messages.append(error_message)
             print(error_message)
             
@@ -204,35 +213,24 @@ def load_pdf_with_advanced_recovery(pdf_file):
     
     return None
 
-class PDFChatbot:
-    def __init__(self, system_prompt: str = None, system_prompt_file: str = None, model_name: str = "openai"):
+class FullContextPDFChatbot:
+    def __init__(self, system_prompt: str = None, model_name: str = "openai"):
         """
         Initialize the chatbot with a system prompt and model name.
         
         Args:
             system_prompt: The system prompt to guide the model's behavior (string)
-            system_prompt_file: Path to a text file containing the system prompt
             model_name: 'openai', 'anthropic', or 'gemini' to select the LLM provider
         """
-        if system_prompt_file:
-            try:
-                with open(system_prompt_file, 'r', encoding='utf-8') as file:
-                    self.system_prompt = file.read()
-            except Exception as e:
-                st.error(f"Error loading system prompt file: {e}")
-                self.system_prompt = "You are a helpful assistant that answers questions based on the provided PDF document."
-        else:
-            self.system_prompt = system_prompt or "You are a helpful assistant that answers questions based on the provided PDF document."
-            
+        self.system_prompt = system_prompt or "You are a helpful assistant that answers questions based on the provided PDF document."
         self.chat_history = ChatMessageHistory()
-        
-        # Instead of deprecated ConversationBufferMemory, we'll manage memory manually
-        self.messages = []
         
         # Initialize with the specified model
         self.set_model(model_name)
-        self.embeddings = OpenAIEmbeddings()
-        self.retriever = None
+        
+        # Store PDF content
+        self.pdf_content = None
+        self.pdf_loaded = False
         
     def set_model(self, model_name: str) -> None:
         """
@@ -255,95 +253,30 @@ class PDFChatbot:
     
     def load_pdf(self, pdf_file) -> None:
         """
-        Load and process a PDF document from an uploaded file using advanced recovery methods.
+        Load and process a PDF document from an uploaded file.
         
         Args:
             pdf_file: Uploaded PDF file object
         """
-        with st.spinner("Processing PDF... This may take a moment."):
+        with st.spinner("Extracting text from PDF... This may take a moment."):
             try:
-                # Try using advanced PDF recovery
-                documents = load_pdf_with_advanced_recovery(pdf_file)
+                # Extract full text from PDF
+                full_text = extract_text_from_pdf(pdf_file)
                 
-                if not documents or len(documents) == 0:
-                    # Try one more approach with pikepdf
-                    try:
-                        import tempfile
-                        import pikepdf
-                        import PyPDF2
-                        from langchain_core.documents import Document
-                        
-                        # Create a temporary file for the original PDF
-                        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
-                            tmp_file.write(pdf_file.getvalue())
-                            original_path = tmp_file.name
-                        
-                        # Create a temporary file for the repaired PDF
-                        repaired_path = original_path + ".repaired.pdf"
-                        
-                        # Try to repair the PDF with pikepdf
-                        with pikepdf.open(original_path, allow_overwriting_input=True) as pdf:
-                            pdf.save(repaired_path)
-                        
-                        # Try to extract text from the repaired PDF
-                        documents = []
-                        with open(repaired_path, 'rb') as file:
-                            try:
-                                pdf_reader = PyPDF2.PdfReader(file, strict=False)
-                                for i, page in enumerate(pdf_reader.pages):
-                                    text = page.extract_text()
-                                    if text and text.strip():
-                                        documents.append(Document(
-                                            page_content=text,
-                                            metadata={"page": i, "source": repaired_path}
-                                        ))
-                            except Exception as e:
-                                st.error(f"Error extracting text from repaired PDF: {e}")
-                        
-                        # Clean up temporary files
-                        try:
-                            os.unlink(original_path)
-                            os.unlink(repaired_path)
-                        except:
-                            pass
-                            
-                        if not documents or len(documents) == 0:
-                            st.error("Could not extract text from the PDF after repair attempts.")
-                            return
-                            
-                    except ImportError:
-                        st.error("pikepdf is not installed. Install with: pip install pikepdf")
-                        return
-                    except Exception as e:
-                        st.error(f"Error during PDF repair: {e}")
-                        return
+                if not full_text:
+                    st.error("Could not extract text from the PDF after multiple attempts.")
+                    return
                 
-                # Split the document into chunks
-                try:
-                    from langchain_text_splitters import RecursiveCharacterTextSplitter
-                    text_splitter = RecursiveCharacterTextSplitter(
-                        chunk_size=1000,
-                        chunk_overlap=100
-                    )
-                    chunks = text_splitter.split_documents(documents)
-                    
-                    if not chunks:
-                        st.error("Could not create text chunks from the PDF.")
-                        return
-                    
-                    # Create a vector store
-                    vectorstore = FAISS.from_documents(chunks, self.embeddings)
-                    
-                    # Set up the retriever
-                    self.retriever = vectorstore.as_retriever(
-                        search_kwargs={"k": 4}
-                    )
-                    
-                    st.success(f"PDF processed and indexed with {len(chunks)} chunks.")
-                except Exception as e:
-                    st.error(f"Error during text splitting or indexing: {e}")
-                    import traceback
-                    st.error(traceback.format_exc())
+                # Store the full text
+                self.pdf_content = full_text
+                self.pdf_loaded = True
+                
+                # Provide information about the document
+                word_count = len(full_text.split())
+                page_estimate = max(1, word_count // 500)  # Rough estimate of page count
+                
+                st.success(f"PDF processed successfully! Extracted approximately {word_count} words (~{page_estimate} pages).")
+                
             except Exception as e:
                 st.error(f"Error processing PDF: {str(e)}")
                 import traceback
@@ -351,7 +284,7 @@ class PDFChatbot:
 
     def create_prompt(self) -> ChatPromptTemplate:
         """
-        Create the chat prompt template with system message and context.
+        Create the chat prompt template with system message and full document context.
         
         Returns:
             ChatPromptTemplate: The configured prompt template
@@ -359,8 +292,8 @@ class PDFChatbot:
         template = """
         {system_prompt}
         
-        Context information from the document:
-        {context}
+        Document Content:
+        {document_content}
         
         Chat History:
         {chat_history}
@@ -389,25 +322,6 @@ class PDFChatbot:
         
         return formatted_history
     
-    def generate_context(self, question: str) -> str:
-        """
-        Generate context from the document based on the question.
-        
-        Args:
-            question: The user's question
-            
-        Returns:
-            str: Relevant context from the document
-        """
-        if not self.retriever:
-            return "No document has been loaded yet."
-        
-        # Using .invoke() instead of deprecated get_relevant_documents()
-        relevant_docs = self.retriever.invoke(question)
-        context = "\n\n".join([doc.page_content for doc in relevant_docs])
-        
-        return context
-    
     def chat(self, question: str) -> str:
         """
         Process a user question and generate a response.
@@ -422,7 +336,7 @@ class PDFChatbot:
         self.chat_history.add_user_message(question)
         
         # If no document is loaded, use a simplified chain without document context
-        if not self.retriever:
+        if not self.pdf_loaded:
             # Create a simple prompt for general conversation
             simple_template = """
             {system_prompt}
@@ -458,20 +372,17 @@ class PDFChatbot:
             
             return response
         
-        # Generate context from relevant document parts
-        context = self.generate_context(question)
-        
         # Format chat history
         chat_history = self.format_chat_history()
         
-        # Create the prompt
+        # Create the prompt with full document context
         prompt = self.create_prompt()
         
         # Create the chain
         chain = (
             {
                 "system_prompt": lambda _: self.system_prompt,
-                "context": lambda _: context,
+                "document_content": lambda _: self.pdf_content,
                 "chat_history": lambda _: chat_history,
                 "question": lambda x: x
             }
@@ -492,11 +403,10 @@ class PDFChatbot:
     def clear_history(self):
         """Clear the chat history"""
         self.chat_history = ChatMessageHistory()
-        self.messages = []
 
 
 def main():
-    st.set_page_config(page_title="PDF AI Chatbot", page_icon="📚", layout="wide")
+    st.set_page_config(page_title="Full Context PDF AI Chatbot", page_icon="📚", layout="wide")
     
     # Improve UI with custom CSS
     st.markdown("""
@@ -516,8 +426,8 @@ def main():
     """, unsafe_allow_html=True)
     
     # App title and description
-    st.title("📚 PDF AI Chatbot")
-    st.markdown("Chat with your PDF documents using AI. Powered by LangChain, OpenAI, Anthropic, and Google Gemini 2.0 Flash.")
+    st.title("📚 Full Context PDF AI Chatbot")
+    st.markdown("Chat with your PDF documents using AI. Uses full document context without vector databases.")
     
     # Initialize session state for storing the chatbot
     if 'chatbot' not in st.session_state:
@@ -539,25 +449,12 @@ def main():
     if not models_available:
         st.error("⚠️ No API keys are set. Please set at least one API key in your Streamlit secrets.")
         st.stop()
-        
-    st.sidebar.write(f"Available models: {', '.join(models_available)}")
     
     # Create sidebar for settings
     with st.sidebar:
         st.header("⚙️ Settings")
         
         # Model selection based on available API keys
-        models_available = []
-        
-        if 'OPENAI_API_KEY' in os.environ or 'OPENAI_API_KEY' in st.secrets:
-            models_available.append("OpenAI (GPT-4o)")
-        
-        if 'ANTHROPIC_API_KEY' in os.environ or 'ANTHROPIC_API_KEY' in st.secrets:
-            models_available.append("Anthropic (Claude 3.7 Sonnet)")
-        
-        if 'GOOGLE_API_KEY' in os.environ or 'GOOGLE_API_KEY' in st.secrets:
-            models_available.append("Google (Gemini 2.0 Flash)")
-        
         model_name = st.selectbox(
             "Select AI Model",
             options=models_available,
@@ -584,7 +481,7 @@ def main():
         if prompt_method == "Text Input":
             system_prompt = st.text_area(
                 "Enter system prompt:",
-                value="You are a helpful assistant that answers questions based on the provided PDF document. Always be concise, accurate, and helpful. If you don't know the answer or the information is not in the document, say so.",
+                value="You are a helpful assistant that answers questions based on the provided PDF document. Always be accurate and reference specific parts of the document when answering questions. If you don't know the answer or the information is not in the document, say so.",
                 height=150
             )
         else:
@@ -599,7 +496,7 @@ def main():
         # Initialize or reinitialize the chatbot
         if st.button("Initialize Chatbot"):
             with st.spinner("Initializing..."):
-                st.session_state.chatbot = PDFChatbot(
+                st.session_state.chatbot = FullContextPDFChatbot(
                     system_prompt=system_prompt,
                     model_name=model_mapping[model_name]
                 )
@@ -617,9 +514,6 @@ def main():
             st.session_state.chatbot.clear_history()
             st.session_state.messages = []
             st.success("Chat history cleared")
-        
-        # Add help text about model switching
-        st.info("You can also switch models directly in the chat interface after initializing the chatbot.")
     
     # Main chat area
     st.header("💬 Chat")
@@ -631,20 +525,9 @@ def main():
         
         with col1:
             # Model selection dropdown in main area
-            models_available = []
-            if 'OPENAI_API_KEY' in os.environ or 'OPENAI_API_KEY' in st.secrets:
-                models_available.append("OpenAI (GPT-4o)")
-            if 'ANTHROPIC_API_KEY' in os.environ or 'ANTHROPIC_API_KEY' in st.secrets:
-                models_available.append("Anthropic (Claude 3.7 Sonnet)")
-            if 'GOOGLE_API_KEY' in os.environ or 'GOOGLE_API_KEY' in st.secrets:
-                models_available.append("Google (Gemini 2.0 Flash)")
-            
-            # Get current model display name
-            current_model_name = next((name for name, id in {
-                "OpenAI (GPT-4o)": "openai",
-                "Anthropic (Claude 3.7 Sonnet)": "anthropic",
-                "Google (Gemini 2.0 Flash)": "gemini"
-            }.items() if id == st.session_state.chatbot.model_name), models_available[0])
+            current_model_name = next((name for name, id in model_mapping.items() 
+                                      if id == st.session_state.chatbot.model_name), 
+                                     models_available[0])
             
             new_model = st.selectbox(
                 "Select AI model:",
@@ -656,16 +539,11 @@ def main():
         with col2:
             # Button to switch models
             if st.button("Switch Model", key="main_switch_model"):
-                model_mapping = {
-                    "OpenAI (GPT-4o)": "openai",
-                    "Anthropic (Claude 3.7 Sonnet)": "anthropic",
-                    "Google (Gemini 2.0 Flash)": "gemini"
-                }
                 new_model_id = model_mapping[new_model]
                 if new_model_id != st.session_state.chatbot.model_name:
                     st.session_state.chatbot.set_model(new_model_id)
                     st.success(f"Switched to {new_model}")
-                    safe_rerun()  # Use safe rerun function
+                    safe_rerun()
         
         with col3:
             # Clear chat button
@@ -673,7 +551,7 @@ def main():
                 st.session_state.chatbot.clear_history()
                 st.session_state.messages = []
                 st.success("Chat history cleared")
-                safe_rerun()  # Use safe rerun function
+                safe_rerun()
     
     # PDF upload capability in the main area
     if st.session_state.chatbot:
@@ -687,6 +565,12 @@ def main():
     if not st.session_state.chatbot:
         st.warning("Please initialize the chatbot from the sidebar first.")
     else:
+        # PDF status indicator
+        if st.session_state.chatbot.pdf_loaded:
+            st.success("PDF loaded and ready for questions")
+        else:
+            st.info("No PDF loaded yet. You can still chat in general mode.")
+            
         # Display chat messages
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
