@@ -180,7 +180,7 @@ def extract_text_from_pdf(pdf_file):
                         
                         # Clean up temporary files
                         try:
-                            os.unlink(original_path)
+                            os.unlink(pdf_path)
                             os.unlink(repaired_path)
                         except:
                             pass
@@ -229,7 +229,7 @@ class FullContextPDFChatbot:
         self.set_model(model_name)
         
         # Store PDF content
-        self.pdf_content = None
+        self.pdf_contents = {}  # Dictionary to store multiple PDFs: {filename: content}
         self.pdf_loaded = False
         
     def set_model(self, model_name: str) -> None:
@@ -253,34 +253,72 @@ class FullContextPDFChatbot:
     
     def load_pdf(self, pdf_file) -> None:
         """
-        Load and process a PDF document from an uploaded file.
+        Load and process a single PDF document from an uploaded file.
         
         Args:
             pdf_file: Uploaded PDF file object
         """
-        with st.spinner("Extracting text from PDF... This may take a moment."):
+        with st.spinner(f"Extracting text from {pdf_file.name}... This may take a moment."):
             try:
                 # Extract full text from PDF
                 full_text = extract_text_from_pdf(pdf_file)
                 
                 if not full_text:
-                    st.error("Could not extract text from the PDF after multiple attempts.")
+                    st.error(f"Could not extract text from {pdf_file.name} after multiple attempts.")
                     return
                 
-                # Store the full text
-                self.pdf_content = full_text
+                # Store the full text with filename as key
+                self.pdf_contents[pdf_file.name] = full_text
                 self.pdf_loaded = True
                 
                 # Provide information about the document
                 word_count = len(full_text.split())
                 page_estimate = max(1, word_count // 500)  # Rough estimate of page count
                 
-                st.success(f"PDF processed successfully! Extracted approximately {word_count} words (~{page_estimate} pages).")
+                st.success(f"PDF '{pdf_file.name}' processed successfully! Extracted approximately {word_count} words (~{page_estimate} pages).")
+                
+                # Update session state to store loaded PDF names
+                if 'loaded_pdfs' not in st.session_state:
+                    st.session_state.loaded_pdfs = []
+                
+                if pdf_file.name not in st.session_state.loaded_pdfs:
+                    st.session_state.loaded_pdfs.append(pdf_file.name)
                 
             except Exception as e:
-                st.error(f"Error processing PDF: {str(e)}")
+                st.error(f"Error processing PDF '{pdf_file.name}': {str(e)}")
                 import traceback
                 st.error(traceback.format_exc())
+    
+    def load_multiple_pdfs(self, pdf_files) -> None:
+        """
+        Load and process multiple PDF documents from uploaded files.
+        
+        Args:
+            pdf_files: List of uploaded PDF file objects
+        """
+        for pdf_file in pdf_files:
+            self.load_pdf(pdf_file)
+    
+    def remove_pdf(self, filename) -> None:
+        """
+        Remove a PDF from the loaded documents.
+        
+        Args:
+            filename: Name of the PDF to remove
+        """
+        if filename in self.pdf_contents:
+            del self.pdf_contents[filename]
+            
+            # Update loaded_pdfs in session state
+            if 'loaded_pdfs' in st.session_state and filename in st.session_state.loaded_pdfs:
+                st.session_state.loaded_pdfs.remove(filename)
+            
+            st.success(f"Removed '{filename}' from loaded documents.")
+            
+            # Update pdf_loaded flag
+            self.pdf_loaded = len(self.pdf_contents) > 0
+        else:
+            st.warning(f"PDF '{filename}' not found in loaded documents.")
 
     def create_prompt(self) -> ChatPromptTemplate:
         """
@@ -321,6 +359,25 @@ class FullContextPDFChatbot:
                 formatted_history += f"AI: {message.content}\n"
         
         return formatted_history
+    
+    def combine_pdf_contents(self) -> str:
+        """
+        Combine all loaded PDF contents into a single string with document markers.
+        
+        Returns:
+            str: Combined PDF content with document markers
+        """
+        if not self.pdf_contents:
+            return ""
+        
+        combined_text = ""
+        
+        # Add each document with a header
+        for filename, content in self.pdf_contents.items():
+            combined_text += f"\n\n--- DOCUMENT: {filename} ---\n\n"
+            combined_text += content
+        
+        return combined_text
     
     def chat(self, question: str) -> str:
         """
@@ -375,6 +432,9 @@ class FullContextPDFChatbot:
         # Format chat history
         chat_history = self.format_chat_history()
         
+        # Combine all PDF contents with document markers
+        combined_pdf_content = self.combine_pdf_contents()
+        
         # Create the prompt with full document context
         prompt = self.create_prompt()
         
@@ -382,7 +442,7 @@ class FullContextPDFChatbot:
         chain = (
             {
                 "system_prompt": lambda _: self.system_prompt,
-                "document_content": lambda _: self.pdf_content,
+                "document_content": lambda _: combined_pdf_content,
                 "chat_history": lambda _: chat_history,
                 "question": lambda x: x
             }
@@ -422,6 +482,12 @@ def main():
         border-radius: 5px;
         margin-top: 10px;
     }
+    .pdf-list {
+        margin-top: 10px;
+        padding: 10px;
+        background-color: #f0f2f6;
+        border-radius: 5px;
+    }
     </style>
     """, unsafe_allow_html=True)
     
@@ -433,6 +499,7 @@ def main():
     if 'chatbot' not in st.session_state:
         st.session_state.chatbot = None
         st.session_state.messages = []
+        st.session_state.loaded_pdfs = []
     
     # Check if API keys are available
     models_available = []
@@ -481,17 +548,13 @@ def main():
         if prompt_method == "Text Input":
             system_prompt = st.text_area(
                 "Enter system prompt:",
-                value="You are a helpful assistant that answers questions based on the provided PDF document. Always be accurate and reference specific parts of the document when answering questions. If you don't know the answer or the information is not in the document, say so.",
+                value="You are a helpful assistant that answers questions based on the provided PDF documents. Always be accurate and reference specific parts of the documents when answering questions. If you don't know the answer or the information is not in the documents, say so. When referencing information, mention which document it came from.",
                 height=150
             )
         else:
             uploaded_prompt = st.file_uploader("Upload system prompt text file", type=["txt"])
             if uploaded_prompt:
                 system_prompt = uploaded_prompt.getvalue().decode("utf-8")
-        
-        # PDF upload
-        st.subheader("Upload Document")
-        uploaded_file = st.file_uploader("Choose a PDF file", type=["pdf"])
         
         # Initialize or reinitialize the chatbot
         if st.button("Initialize Chatbot"):
@@ -502,12 +565,17 @@ def main():
                 )
                 st.session_state.messages = []
                 st.success(f"Chatbot initialized with {model_name} model")
-                st.info("You can now start chatting! Upload a PDF anytime if you want to discuss a document.")
+                st.info("You can now start chatting! Upload PDFs anytime if you want to discuss documents.")
         
-        # Load PDF if uploaded in the sidebar
-        if uploaded_file and st.session_state.chatbot:
-            if st.button("Process PDF", key="sidebar_process_pdf"):
-                st.session_state.chatbot.load_pdf(uploaded_file)
+        # PDF upload section in sidebar
+        if st.session_state.chatbot:
+            st.subheader("Upload Documents")
+            uploaded_files = st.file_uploader("Choose PDF files", type=["pdf"], accept_multiple_files=True)
+            
+            if uploaded_files:
+                if st.button("Process PDFs", key="sidebar_process_pdfs"):
+                    for pdf_file in uploaded_files:
+                        st.session_state.chatbot.load_pdf(pdf_file)
         
         # Clear chat history
         if st.session_state.chatbot and st.button("Clear Chat History"):
@@ -553,13 +621,34 @@ def main():
                 st.success("Chat history cleared")
                 safe_rerun()
     
-    # PDF upload capability in the main area
+    # PDF upload capability in the main area with multiple file support
     if st.session_state.chatbot:
-        with st.expander("📄 Upload PDF Document", expanded=False):
-            main_uploaded_file = st.file_uploader("Choose a PDF file to chat with", type=["pdf"], key="main_pdf_uploader")
-            if main_uploaded_file:
-                if st.button("Process PDF", key="main_process_pdf"):
-                    st.session_state.chatbot.load_pdf(main_uploaded_file)
+        with st.expander("📄 Upload PDF Documents", expanded=False):
+            main_uploaded_files = st.file_uploader(
+                "Choose PDF files to chat with", 
+                type=["pdf"], 
+                accept_multiple_files=True,
+                key="main_pdf_uploader"
+            )
+            
+            if main_uploaded_files:
+                if st.button("Process PDFs", key="main_process_pdfs"):
+                    for pdf_file in main_uploaded_files:
+                        st.session_state.chatbot.load_pdf(pdf_file)
+        
+        # Show currently loaded PDFs with ability to remove them
+        if hasattr(st.session_state, 'loaded_pdfs') and st.session_state.loaded_pdfs:
+            with st.expander("📚 Loaded Documents", expanded=True):
+                st.write(f"Currently loaded documents: {len(st.session_state.loaded_pdfs)}")
+                
+                for pdf_name in st.session_state.loaded_pdfs:
+                    col1, col2 = st.columns([5, 1])
+                    with col1:
+                        st.write(f"• {pdf_name}")
+                    with col2:
+                        if st.button("Remove", key=f"remove_{pdf_name}"):
+                            st.session_state.chatbot.remove_pdf(pdf_name)
+                            safe_rerun()
     
     # Display warning if chatbot is not initialized
     if not st.session_state.chatbot:
@@ -567,9 +656,9 @@ def main():
     else:
         # PDF status indicator
         if st.session_state.chatbot.pdf_loaded:
-            st.success("PDF loaded and ready for questions")
+            st.success(f"{len(st.session_state.loaded_pdfs)} PDFs loaded and ready for questions")
         else:
-            st.info("No PDF loaded yet. You can still chat in general mode.")
+            st.info("No PDFs loaded yet. You can still chat in general mode.")
             
         # Display chat messages
         for message in st.session_state.messages:
@@ -577,7 +666,7 @@ def main():
                 st.write(message["content"])
         
         # Chat input
-        user_input = st.chat_input("Ask a question about your document...")
+        user_input = st.chat_input("Ask a question about your documents...")
         
         if user_input:
             # Add user message to UI
